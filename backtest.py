@@ -1,222 +1,102 @@
-"""
-Finboost Backtest Engine
------------------------------------------
-✓ Loads trained Finboost model
-✓ Evaluates on processed_<pair>.parquet files
-✓ Simulates SL/TP, reversal exit, 5m scalping
-✓ Outputs metrics | PnL | Plot-ready logs
------------------------------------------
-"""
-
 import os
 import json
-import pandas as pd
-import numpy as np
 import torch
-import torch.nn.functional as F
-from datetime import datetime
-from utils.logger import get_logger
-
-# Load settings
-with open("configs/settings.json", "r") as f:
-    SETTINGS = json.load(f)
-
-SEQ_LEN = SETTINGS["model"]["seq_len"]
-SL_TP_RATIO = SETTINGS["execution"]["sl_tp_ratio"]
-MAX_RISK = SETTINGS["execution"]["max_trade_risk_pct"] / 100
-TIMEFRAME = SETTINGS["timeframe"]
-
-logger = get_logger("Backtest", SETTINGS["logging"]["log_file"], SETTINGS["logging"]["level"])
+import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
+from configs.settings import SETTINGS
+from models import FinboostModel
 
 
-# ----------------------------
-# Load Model (PyTorch)
-# ----------------------------
-def load_model(model_path, input_dim):
-    """Loads a trained PyTorch model."""
-    from models import FinboostModel  # your TCN/Attention model
-
-    model = FinboostModel(input_dim=input_dim)
-    model.load_state_dict(torch.load(model_path, map_location="cpu"))
-    model.eval()
-    return model
+def load_processed_data(pair):
+    path = f"data/processed_{pair}.parquet"
+    if not os.path.exists(path):
+        print(f"[ERROR] Processed data not found for {pair}: {path}")
+        return None
+    return pd.read_parquet(path)
 
 
-# ----------------------------
-# Build input sequences
-# ----------------------------
-def create_sequences(df, feature_cols):
+def build_sequences(df, seq_len, feature_cols):
     X = []
-    indices = []
-
-    for i in range(len(df) - SEQ_LEN):
-        X.append(df[feature_cols].iloc[i : i + SEQ_LEN].values)
-        indices.append(i + SEQ_LEN)
-
-    X = torch.tensor(np.array(X), dtype=torch.float32)
-    return X, indices
+    for i in range(len(df) - seq_len):
+        seq = df[feature_cols].iloc[i:i+seq_len].values
+        X.append(seq)
+    return torch.tensor(X, dtype=torch.float32)
 
 
-# ----------------------------
-# Run model predictions
-# ----------------------------
-def predict(model, X):
-    """Run neural network predictions for:
-       next_candle, reversal, regime.
-    """
-    with torch.no_grad():
-        preds = model(X)
-    return preds
+def run_backtest_for_pair(pair):
+    print(f"\n=== BACKTESTING {pair} ===")
 
+    df = load_processed_data(pair)
+    if df is None:
+        return {"pair": pair, "status": "no_data"}
 
-# ----------------------------
-# Trading Logic
-# ----------------------------
-def run_strategy(df, preds, idx_list):
-    balance = 10000
-    equity_curve = []
-    trades = []
+    # 🔥 THE CORRECT FEATURES (match feature_engineering.py)
+    feature_cols = [
+        "close",
+        "rsi",
+        "ma_10",
+        "ma_20",
+        "ma_50",
+        "volatility",
+        "return",
+        "hour",
+        "minute",
+        "dayofweek"
+    ]
 
-    df["pred_ret"] = np.nan
-    df["pred_rev"] = np.nan
-    df["signal"] = 0
+    missing = [f for f in feature_cols if f not in df.columns]
+    if missing:
+        print(f"[ERROR] Missing features: {missing}")
+        return {"pair": pair, "status": "missing_features", "missing": missing}
 
-    next_candle, reversal_prob, regime = preds
+    seq_len = SETTINGS["model"]["seq_len"]
+    X = build_sequences(df, seq_len, feature_cols)
 
-    next_candle = next_candle.squeeze().numpy()
-    reversal_prob = reversal_prob.squeeze().numpy()
+    if len(X) == 0:
+        print(f"[ERROR] Not enough data to build sequences for {pair}")
+        return {"pair": pair, "status": "no_sequences"}
 
-    for pred, rev, idx in zip(next_candle, reversal_prob, idx_list):
-
-        df.loc[idx, "pred_ret"] = pred
-        df.loc[idx, "pred_rev"] = rev
-
-        # Signal logic
-        if pred > 0 and rev < 0.4:
-            df.loc[idx, "signal"] = 1  # buy
-        elif pred < 0 and rev < 0.4:
-            df.loc[idx, "signal"] = -1  # sell
-
-    # ----------------------------
-    # Simulated Trading
-    # ----------------------------
-    position = 0
-    entry_price = 0
-
-    for i in range(SEQ_LEN, len(df)):
-        sig = df.loc[i, "signal"]
-        price = df.loc[i, "close"]
-
-        # Open a new trade
-        if position == 0 and sig != 0:
-
-            risk_amount = balance * MAX_RISK
-            qty = risk_amount / price
-
-            position = sig
-            entry_price = price
-
-            sl = entry_price * (0.99 if sig == 1 else 1.01)
-            tp = entry_price * (1 + SL_TP_RATIO * 0.01) if sig == 1 else entry_price * (1 - SL_TP_RATIO * 0.01)
-
-            trades.append(["ENTRY", i, price, sig])
-
-        # Manage open trade
-        if position != 0:
-
-            # reversal exit
-            if df.loc[i, "pred_rev"] > 0.65:
-                pnl = (price - entry_price) * position * qty
-                balance += pnl
-                trades.append(["REV_EXIT", i, price, pnl])
-                position = 0
-                continue
-
-            # take profit
-            if (position == 1 and price >= tp) or (position == -1 and price <= tp):
-                pnl = (tp - entry_price) * position * qty
-                balance += pnl
-                trades.append(["TP", i, tp, pnl])
-                position = 0
-                continue
-
-            # stop loss
-            if (position == 1 and price <= sl) or (position == -1 and price >= sl):
-                pnl = (sl - entry_price) * position * qty
-                balance += pnl
-                trades.append(["SL", i, sl, pnl])
-                position = 0
-                continue
-
-        equity_curve.append(balance)
-
-    return balance, trades, equity_curve
-
-
-# ----------------------------
-# Full Backtest Runner
-# ----------------------------
-def backtest_pair(pair):
-    logger.info(f"▶ Backtesting {pair}")
-
-    df_path = f"data/processed_{pair}.parquet"
-
-    if not os.path.exists(df_path):
-        logger.error(f"Missing processed file: {df_path}")
-        return None
-
-    df = pd.read_parquet(df_path)
-
-    feature_cols = ["open", "high", "low", "close", "volume", "rsi", "atr", "macd"]
-
-    model_path = f"models/{pair}_model.pt"
+    # 🔥 LOAD THE CORRECT MODEL FILE
+    model_path = f"models/{pair}_best.pt"
     if not os.path.exists(model_path):
-        logger.error(f"Missing model for {pair}")
-        return None
+        print(f"[ERROR] Model checkpoint not found: {model_path}")
+        return {"pair": pair, "status": "missing_model"}
 
-    model = load_model(model_path, input_dim=len(feature_cols))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = FinboostModel(input_dim=len(feature_cols)).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
 
-    X, idx_list = create_sequences(df, feature_cols)
-    preds = predict(model, X)
+    preds = []
+    loader = DataLoader(TensorDataset(X), batch_size=64, shuffle=False)
 
-    final_balance, trades, equity_curve = run_strategy(df, preds, idx_list)
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch[0].to(device)
+            out = model(batch)
+            next_candle = out["next_candle"].cpu().numpy().flatten()
+            preds.extend(next_candle)
 
-    results = {
-        "pair": pair,
-        "final_balance": final_balance,
-        "total_return_%": round(((final_balance - 10000) / 10000) * 100, 2),
-        "num_trades": len(trades),
-        "trades": trades
-    }
-
-    # Save result file
-    save_path = f"backtest_results/{pair}_results.json"
+    # Save results
+    out_path = f"backtest_results/{pair}_results.json"
     os.makedirs("backtest_results", exist_ok=True)
+    json.dump({"pair": pair, "predictions": preds}, open(out_path, "w"), indent=4)
 
-    with open(save_path, "w") as f:
-        json.dump(results, f, indent=4)
+    print(f"[OK] Backtest saved → {out_path}")
 
-    logger.info(f"✓ Backtest complete for {pair}")
-    logger.info(f"Final Balance: {final_balance:.2f}")
-    logger.info(f"Saved results: {save_path}")
-
-    return results
+    return {"pair": pair, "status": "ok", "predictions": len(preds)}
 
 
-# ----------------------------
-# Run all pairs
-# ----------------------------
-def backtest_all():
-    all_results = []
+def main():
+    pairs = SETTINGS["pairs"]
+    results = {}
 
-    for pair in SETTINGS["pairs"]:
-        res = backtest_pair(pair)
-        if res:
-            all_results.append(res)
+    for pair in pairs:
+        results[pair] = run_backtest_for_pair(pair)
 
-    logger.info("ALL BACKTESTS DONE")
-    return all_results
+    json.dump(results, open("backtest_results/summary.json", "w"), indent=4)
+    print("\n=== BACKTEST COMPLETE ===")
 
 
 if __name__ == "__main__":
-    backtest_all()
+    main()
