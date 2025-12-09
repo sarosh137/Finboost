@@ -5,3 +5,4 @@ logs/
 models/
 *.pyc
 venv/ 
+configs/settings.json 

@@ -1,0 +1,37 @@
+{
+  "pairs": ["EURUSD", "GBPUSD"],
+  "timeframe": "M1",
+  "history_months": 1,
+
+  "model": {
+    "seq_len": 128,
+    "batch_size": 32,
+    "epochs": 10,
+    "learning_rate": 0.0005
+  },
+
+  "mt5": {
+    "login": "",
+    "password": "",
+    "server": "",
+    "path": ""
+  },
+
+  "binance": {
+    "api_key": "",
+    "api_secret": "",
+    "base_url": "https://api.binance.com"
+  },
+
+  "logging": {
+    "file": "logs/finboost.log"
+  },
+
+  "finnhub": {
+    "api_key": ""
+  },
+
+  "twelvedata": {
+    "api_key": ""
+  }
+}
