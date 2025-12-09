@@ -1,0 +1,13 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+torch
+ta
+ccxt
+yfinance
+python-binance
+MetaTrader5
+lightgbm
+tqdm
+einops

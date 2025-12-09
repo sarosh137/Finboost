@@ -1,0 +1,19 @@
+# Finboost settings (template). DO NOT STORE API KEYS IN REPO.
+data:
+  sample_data_dir: data/sample_pairs
+  seq_len: 120
+  features: ['open','high','low','close','volume']
+training:
+  batch_size: 64
+  epochs: 2
+  lr: 1e-4
+backtest:
+  initial_balance: 10000
+  sl_atr_multiplier: 1.0
+  tp_ratio: 2.0
+execution:
+  mt5_enabled: false
+  binance_enabled: false
+  max_position_pct: 0.02
+logging:
+  out_dir: logs
